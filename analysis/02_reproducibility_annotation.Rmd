@@ -1,0 +1,398 @@
+---
+title: "AKNA PureCLIP reproducibility and genomic annotation"
+output: html_document
+params:
+  annotation_gtf: "data/reference/gencode.vM25.annotation.gtf"
+  curated_sites: "results/analysis/01_pureclip_postprocessing/replicates_noKO_curated_peaks.bed"
+  wt1_plus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT1.plus.bw"
+  wt1_minus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT1.minus.bw"
+  wt2_plus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT2.plus.bw"
+  wt2_minus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT2.minus.bw"
+  wt3_plus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT3.plus.bw"
+  wt3_minus_bw: "results/preprocessing/akna/crosslinked_nucleotides/WT3.minus.bw"
+  peak_calling_dir: "results/preprocessing/akna/peak_calling"
+  utils_r: "workflow/utils/utils.r"
+  output_bed: "results/analysis/02_reproducibility/bs_clean_noKO.bed"
+  output_csv: "results/analysis/02_reproducibility/bs_clean_noKO.csv"
+  output_workbook: "results/analysis/02_reproducibility/reproducible_binding_sites_groups_noKO.xlsx"
+  go_output_dir: "results/analysis/02_reproducibility/GO"
+---
+
+This analysis selects sites supported in at least two of the three WT
+replicates, annotates protein-coding genes and transcript regions, and performs
+the original exploratory GO grouping.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+input_file <- knitr::current_input(dir = TRUE)
+project_root <- normalizePath(file.path(dirname(input_file), ".."), mustWork = TRUE)
+resolve_repo_path <- function(path) {
+  if (grepl("^(/|[A-Za-z]:[/\\\\])", path)) path else file.path(project_root, path)
+}
+paths <- lapply(params, resolve_repo_path)
+
+library(rtracklayer)
+library(GenomicRanges)
+library(ggplot2)
+library(AnnotationDbi)
+library(dplyr)
+library(reshape2)
+library(UpSetR)
+library(GenomicFeatures)
+library(data.table)
+library(readr)
+library(topGO)
+library(GO.db)
+library(biomaRt)
+library(Rgraphviz)
+library(openxlsx)
+
+source(paths$utils_r)
+dir.create(dirname(paths$output_bed), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(paths$output_csv), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(paths$output_workbook), recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$go_output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Reproducibility across WT replicates
+
+```{r import-inputs}
+tracks <- list(
+  WT1 = list(
+    plus = import(paths$wt1_plus_bw, "BigWig", as = "Rle"),
+    minus = import(paths$wt1_minus_bw, "BigWig", as = "Rle")
+  ),
+  WT2 = list(
+    plus = import(paths$wt2_plus_bw, "BigWig", as = "Rle"),
+    minus = import(paths$wt2_minus_bw, "BigWig", as = "Rle")
+  ),
+  WT3 = list(
+    plus = import(paths$wt3_plus_bw, "BigWig", as = "Rle"),
+    minus = import(paths$wt3_minus_bw, "BigWig", as = "Rle")
+  )
+)
+
+bs <- import(paths$curated_sites, format = "BED")
+bs <- keepStandardChromosomes(bs, pruning.mode = "coarse")
+mcols(bs) <- NULL
+```
+
+```{r quantify-replicates}
+bs.p <- bs[strand(bs) == "+"]
+bs.m <- bs[strand(bs) == "-"]
+
+for (sample in names(tracks)) {
+  mcols(bs.p)[[sample]] <- sum_track_over_ranges(tracks[[sample]]$plus, bs.p)
+  mcols(bs.m)[[sample]] <- sum_track_over_ranges(tracks[[sample]]$minus, bs.m)
+}
+bs <- c(bs.p, bs.m)
+
+df <- as.data.frame(as.matrix(mcols(bs)))
+df[df > 40] <- 40
+df <- reshape2::melt(df)
+
+aa <- data.frame(
+  cutoff = c(
+    quantile(bs$WT1, probs = seq(0, 1, by = 0.1))[2],
+    quantile(bs$WT2, probs = seq(0, 1, by = 0.1))[2],
+    quantile(bs$WT3, probs = seq(0, 1, by = 0.1))[2]
+  ),
+  variable = c("WT1", "WT2", "WT3")
+)
+aa$cutoff[aa$cutoff < 2] <- 2
+
+ggplot(df, aes(x = value, group = variable)) +
+  geom_histogram(binwidth = 1) +
+  facet_grid(~variable) +
+  geom_vline(data = aa, aes(xintercept = cutoff), color = "red") +
+  scale_y_log10()
+
+names(bs) <- seq_along(bs)
+NameList <- list(
+  WT1 = names(bs[bs$WT1 >= aa$cutoff[1]]),
+  WT2 = names(bs[bs$WT2 >= aa$cutoff[2]]),
+  WT3 = names(bs[bs$WT3 >= aa$cutoff[3]])
+)
+upset(fromList(NameList), order.by = "freq", nsets = 3,
+      text.scale = c(2, 2, 2, 1.6, 2, 2))
+
+status <- data.frame(
+  r1 = as.integer(bs$WT1 >= aa$cutoff[1]),
+  r2 = as.integer(bs$WT2 >= aa$cutoff[2]),
+  r3 = as.integer(bs$WT3 >= aa$cutoff[3])
+)
+bs$filter <- rowSums(status) >= 2
+bs.filter <- bs[bs$filter]
+names(bs.filter) <- seq_along(bs.filter)
+cat("Sites reproducible in at least two WT replicates:", length(bs.filter), "\n")
+```
+
+# Genomic annotation
+
+```{r annotation-database}
+anno <- import(paths$annotation_gtf, format = "GTF")
+anno <- anno[anno$level != 3]
+anno$transcript_support_level[is.na(anno$transcript_support_level)] <- 0
+anno$transcript_support_level[anno$transcript_support_level == "NA"] <- 10
+anno <- anno[anno$transcript_support_level %in% c(0, 1, 2, 3)]
+anno.db <- makeTxDbFromGRanges(anno)
+
+gns <- GenomicFeatures::genes(anno.db)
+idx <- match(gns$gene_id, anno$gene_id)
+elementMetadata(gns) <- cbind(
+  elementMetadata(gns),
+  elementMetadata(anno)[idx, ]
+)
+bs <- bs.filter
+```
+
+```{r gene-overview}
+targets <- subsetByOverlaps(gns, bs)
+gene_type_counts <- data.frame(gene_type = targets$gene_type) %>%
+  table() %>%
+  as.data.frame()
+ggplot(gene_type_counts, aes(x = reorder(gene_type, -Freq), y = Freq)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  xlab("Gene type") + ylab("Genes")
+```
+
+```{r single-protein-coding-target}
+targets <- subsetByOverlaps(gns, bs)
+targets.prot <- targets[targets$gene_type == "protein_coding"]
+bs.prot <- subsetByOverlaps(bs, targets.prot)
+bs.clean <- bs.prot[countOverlaps(bs.prot, targets.prot) == 1]
+
+overlaps <- findOverlaps(bs.clean, targets.prot)
+mcols(bs.clean)$gene_id <- targets.prot$gene_id[subjectHits(overlaps)]
+mcols(bs.clean)$gene_type <- targets.prot$gene_type[subjectHits(overlaps)]
+mcols(bs.clean)$gene_name <- targets.prot$gene_name[subjectHits(overlaps)]
+```
+
+```{r transcript-region}
+cds_regions <- cds(anno.db)
+intron_regions <- unlist(intronsByTranscript(anno.db))
+utr3_regions <- unlist(threeUTRsByTranscript(anno.db))
+utr5_regions <- unlist(fiveUTRsByTranscript(anno.db))
+
+count.df <- data.frame(
+  cds = countOverlaps(bs.clean, cds_regions),
+  intron = countOverlaps(bs.clean, intron_regions),
+  utr3 = countOverlaps(bs.clean, utr3_regions),
+  utr5 = countOverlaps(bs.clean, utr5_regions)
+)
+rule <- c("cds", "utr3", "utr5", "intron")
+count.df <- count.df[, rule] %>%
+  as.matrix() %>%
+  cbind.data.frame(outside = as.integer(rowSums(count.df) == 0))
+region_names <- colnames(count.df)
+reg <- apply(count.df, 1, function(x) region_names[which.max(x)])
+mcols(bs.clean)$region <- reg
+
+keep <- bs.clean$region != "outside"
+bs.clean <- bs.clean[keep]
+reg <- reg[keep]
+
+region_ranges <- list(
+  cds = cds_regions,
+  utr3 = utr3_regions,
+  utr5 = utr5_regions,
+  intron = intron_regions
+)
+region_start <- lapply(seq_along(bs.clean), function(i) {
+  candidate <- region_ranges[[reg[i]]]
+  hits <- subjectHits(findOverlaps(bs.clean[i], candidate))
+  if (length(hits) == 0) return(NA_integer_)
+  start(candidate[hits])
+})
+region_end <- lapply(seq_along(bs.clean), function(i) {
+  candidate <- region_ranges[[reg[i]]]
+  hits <- subjectHits(findOverlaps(bs.clean[i], candidate))
+  if (length(hits) == 0) return(NA_integer_)
+  end(candidate[hits])
+})
+mcols(bs.clean)$region_start <- region_start
+mcols(bs.clean)$region_end <- region_end
+
+# This reproduces the manuscript source definition: non-zero signal, not the
+# percentile cutoff, is counted in this descriptive column.
+mcols(bs.clean)$n_reproducible <- rowSums(
+  cbind(bs.clean$WT1, bs.clean$WT2, bs.clean$WT3) != 0
+)
+```
+
+# Add PureCLIP scores
+
+```{r pureclip-scores}
+for (sample in c("WT1", "WT2", "WT3", "replicates")) {
+  peak_file <- file.path(
+    paths$peak_calling_dir,
+    paste0(sample, "_noinputcontroldata_PureCLIP.crosslink_sites_short.bed")
+  )
+  peaks <- read_delim(
+    peak_file,
+    delim = "\t",
+    col_names = c("seqnames", "start", "end", "width", "score", "strand"),
+    show_col_types = FALSE
+  )
+  peaks_gr <- GRanges(
+    seqnames = peaks$seqnames,
+    ranges = IRanges(start = peaks$start, end = peaks$end),
+    strand = peaks$strand,
+    score = peaks$score
+  )
+  score_overlaps <- findOverlaps(bs.clean, peaks_gr)
+  scores <- rep(NA_real_, length(bs.clean))
+  scores[queryHits(score_overlaps)] <- peaks_gr$score[subjectHits(score_overlaps)]
+  mcols(bs.clean)[[paste0(sample, "_score")]] <- scores
+}
+
+score_cols <- as.matrix(
+  mcols(bs.clean)[, c("WT1_score", "WT2_score", "WT3_score")]
+)
+mcols(bs.clean)$average_score <- rowMeans(score_cols, na.rm = TRUE)
+bs.clean <- bs.clean[order(-mcols(bs.clean)$average_score)]
+```
+
+```{r export-bed-csv}
+export(bs.clean, paths$output_bed, format = "BED")
+bs.clean.df <- flatten_list_columns(as.data.frame(bs.clean))
+write.csv(bs.clean.df, paths$output_csv, row.names = FALSE)
+
+cat("Annotated reproducible 9-nt sites:", length(bs.clean), "\n")
+cat("Unique annotated target genes:", length(unique(bs.clean$gene_name)), "\n")
+```
+
+# Exploratory GO analysis and manuscript groups
+
+```{r go-functions}
+compute_geneset_enrichment <- function(ontology = "BP", bg_genes,
+                                       candidate_list, output_file = NULL) {
+  if (!exists("db", inherits = TRUE) || class(db)[1] != "Mart") {
+    db <<- useMart(
+      "ENSEMBL_MART_ENSEMBL",
+      dataset = "mmusculus_gene_ensembl",
+      host = "https://www.ensembl.org"
+    )
+    go_ids <<- getBM(
+      attributes = c("go_id", "external_gene_name", "namespace_1003"),
+      filters = "external_gene_name",
+      values = bg_genes,
+      mart = db
+    )
+    gene_2_GO <<- unstack(go_ids[, c(1, 2)])
+  }
+
+  candidate_list <- candidate_list[candidate_list %in% go_ids[, 2]]
+  geneList <- factor(as.integer(bg_genes %in% candidate_list))
+  names(geneList) <- bg_genes
+  GOdata <<- new(
+    "topGOdata",
+    ontology = ontology,
+    allGenes = geneList,
+    annot = annFUN.gene2GO,
+    gene2GO = gene_2_GO,
+    nodeSize = 20
+  )
+  weight_fisher_result <- runTest(
+    GOdata,
+    algorithm = "weight01",
+    statistic = "fisher"
+  )
+  all_res <- GenTable(
+    GOdata,
+    weightFisher = weight_fisher_result,
+    orderBy = "weightFisher",
+    topNodes = length(usedGO(GOdata))
+  )
+  all_res$p.adj <- round(p.adjust(all_res$weightFisher, method = "BH"), 4)
+  all_res$weightFisher <- as.numeric(all_res$weightFisher)
+  all_res$p.adj <- as.numeric(all_res$p.adj)
+  result <- all_res[all_res$p.adj <= 0.05, ]
+  if (!is.null(output_file)) {
+    write.table(result, output_file, sep = ",", quote = FALSE, row.names = FALSE)
+  }
+  result
+}
+
+extract_binding_targets <- function(go_term_id, ontology, bg_genes,
+                                    candidate_list, sites) {
+  compute_geneset_enrichment(ontology, bg_genes, candidate_list)
+  term_genes <- if (go_term_id %in% usedGO(GOdata)) {
+    genesInTerm(GOdata, go_term_id)[[1]]
+  } else {
+    character()
+  }
+  selected_genes <- intersect(term_genes, candidate_list)
+  selected_sites <- as.data.frame(sites[sites$gene_name %in% selected_genes])
+  list(
+    genes = selected_genes,
+    binding_sites = selected_sites,
+    num_genes = length(selected_genes),
+    num_binding_sites = nrow(selected_sites)
+  )
+}
+```
+
+```{r go-analysis}
+bg_genes <- unique(gns$gene_name[gns$gene_type == "protein_coding"])
+bg_genes <- bg_genes[!is.na(bg_genes) & bg_genes != ""]
+candidate_list <- unique(bs.clean$gene_name)
+candidate_list <- candidate_list[candidate_list %in% bg_genes]
+
+for (ontology in c("BP", "CC", "MF")) {
+  compute_geneset_enrichment(
+    ontology,
+    bg_genes,
+    candidate_list,
+    file.path(
+      paths$go_output_dir,
+      paste0("bs_clean_GO_", ontology, "_analysis_noKO.csv")
+    )
+  )
+}
+```
+
+```{r grouped-workbook}
+go_terms <- list(
+  "centrosome" = list(id = "GO:0005813", ontology = "CC"),
+  "local transport" = list(id = "GO:0035082", ontology = "BP"),
+  "immunological synapse" = list(id = "GO:0001772", ontology = "CC"),
+  "cytoskeleton" = list(id = "GO:0015629", ontology = "CC")
+)
+
+sheets <- list(all_reproducible_binding_sites = bs.clean.df)
+barplot_data <- data.frame(GO_term = character(), Num_binding_sites = integer())
+for (go_name in names(go_terms)) {
+  go_info <- go_terms[[go_name]]
+  result <- extract_binding_targets(
+    go_info$id,
+    go_info$ontology,
+    bg_genes,
+    candidate_list,
+    bs.clean
+  )
+  sheets[[go_name]] <- flatten_list_columns(result$binding_sites)
+  barplot_data <- rbind(
+    barplot_data,
+    data.frame(GO_term = go_name, Num_binding_sites = result$num_binding_sites)
+  )
+}
+
+non_intronic <- bs.clean.df[bs.clean.df$region != "intron", ]
+sheets[["non-intronic BS"]] <- non_intronic
+write.xlsx(sheets, file = paths$output_workbook, overwrite = TRUE)
+
+barplot_data <- rbind(
+  barplot_data,
+  data.frame(GO_term = "reproducible BS", Num_binding_sites = length(bs.clean)),
+  data.frame(GO_term = "non-intronic BS", Num_binding_sites = nrow(non_intronic))
+)
+ggplot(barplot_data, aes(x = reorder(GO_term, -Num_binding_sites),
+                         y = Num_binding_sites)) +
+  geom_bar(stat = "identity", fill = "black") +
+  geom_text(aes(label = Num_binding_sites), vjust = -0.5) +
+  theme_minimal() +
+  labs(x = "GO term/group", y = "Number of binding sites") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

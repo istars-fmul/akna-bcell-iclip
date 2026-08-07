@@ -1,0 +1,34 @@
+# Paths are interpreted from the repository root. Barcode and adapter FASTA
+# contents are experiment-specific, user-supplied, and intentionally ignored.
+paths:
+  input: data/raw/{sequencing_run}.fastq.gz
+  output_dir: results/preprocessing
+  barcodes_fasta: data/raw/barcodes.fasta
+  adapters_fasta: data/raw/adapter.fasta
+  reference_genome_fasta: data/reference/GRCm38.primary_assembly.genome.fa
+  genome_mapping_index: data/reference/STAR_GRCm38_GencodeM25
+  annotation_gtf: data/reference/gencode.vM25.annotation.gtf
+
+sequencing_runs:
+  - akna
+
+samples:
+  - WT1
+  - WT2
+  - WT3
+  - KO1
+  - KO2
+
+sample_groups:
+  akna:
+    replicates: [WT1, WT2, WT3]
+    controls: [KO1, KO2]
+
+params:
+  min_read_length: 15
+  max_read_length: 95
+  min_base_quality: 10
+  first_umi_length: 4
+  experimental_barcode_length: 6
+  second_umi_length: 5
+  ram_limit_genome_mapping: 24000000000.0
