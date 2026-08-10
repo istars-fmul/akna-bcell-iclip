@@ -15,8 +15,7 @@ wild-type (WT1, WT2, and WT3) and two *Akna* knockout (KO1 and KO2) replicates.
    (`replicates`). KO samples are processed into tracks but are not PureCLIP
    input controls or default PureCLIP targets.
 2. `analysis/01` through `analysis/05` perform PureCLIP postprocessing,
-   replicate reproducibility and annotation, WT/KO signal comparison,
-   corrected GO analysis, and manuscript figure exploration.
+   replicate reproducibility and annotation, WT/KO signal comparison, GO analysis, and manuscript figure exploration.
 
 ## Required inputs
 
