@@ -4,10 +4,6 @@ This repository contains the computational analysis of AKNA iCLIP2 in mouse
 in vitro-induced germinal center B (iGB) cells. The experiment comprises three
 wild-type (WT1, WT2, and WT3) and two *Akna* knockout (KO1 and KO2) replicates.
 
-This is a code-only publication repository. It does not distribute sequencing
-data, reference data, barcodes, adapters, intermediate files, results, or
-figures. Inputs must be obtained or provided separately. The sequencing-data
-accession will be added when available.
 
 ## Analysis stages
 
@@ -19,8 +15,7 @@ accession will be added when available.
    (`replicates`). KO samples are processed into tracks but are not PureCLIP
    input controls or default PureCLIP targets.
 2. `analysis/01` through `analysis/05` perform PureCLIP postprocessing,
-   replicate reproducibility and annotation, WT/KO signal comparison,
-   corrected GO analysis, and manuscript figure exploration.
+   replicate reproducibility and annotation, WT/KO signal comparison, GO analysis, and manuscript figure exploration.
 
 ## Required inputs
 
