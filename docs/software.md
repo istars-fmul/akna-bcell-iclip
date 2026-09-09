@@ -37,16 +37,42 @@ These supporting containers do not alter the named manuscript tool versions.
 ## R packages
 
 The downstream analyses load packages explicitly in each file. In addition to
-`topGO` and `biomaRt`, they require packages including `rmarkdown`, `knitr`,
+`topGO` and `biomaRt`, they require packages including `IRkernel`,
 `rtracklayer`, `GenomicRanges`, `GenomicFeatures`, `AnnotationDbi`, `GO.db`,
 `Rgraphviz`, `dplyr`, `tidyr`, `readr`, `readxl`, `openxlsx`, `writexl`,
 `ggplot2`, `UpSetR`, `reshape2`, `forcats`, `stringr`, `scales`, and `svglite`.
 
 Use R 4.4.0 with a matching Bioconductor release and verify package versions
-with `sessionInfo()`. Analysis `05` records session information in its rendered
+with `sessionInfo()`. Analysis `05` prints session information in its final
 notebook. BioMart-backed analyses require network access and may vary if the
 live Ensembl annotation service changes; the GENCODE M25 protein-coding
 background and manuscript count checks constrain the analysis input.
+
+## Jupyter and the R kernel
+
+Install JupyterLab in your chosen Python environment:
+
+```bash
+python -m pip install jupyterlab
+```
+
+With that environment active and `jupyter` on `PATH`, use the R installation
+containing the analysis packages to install and register IRkernel:
+
+```r
+install.packages("IRkernel", repos = "https://cloud.r-project.org")
+IRkernel::installspec(user = TRUE, name = "ir", displayname = "R")
+```
+
+Check registration with `jupyter kernelspec list`, then launch `jupyter lab`
+from the repository root. Open an analysis notebook and select **R**. Check
+`R.version.string` and `sessionInfo()` in the kernel to confirm that it uses
+the intended R installation and packages. IRkernel provides the notebook
+interface; the R packages listed above are still required for the analyses.
+
+The notebooks do not require R Markdown rendering or Pandoc. They are stored
+with empty outputs and execution counts; run cells in order after setting the
+paths in the first code cell.
 
 ## Apptainer
 

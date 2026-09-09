@@ -14,11 +14,11 @@ Analysis sources from `proj-rbp-akna` were:
 
 | Publication file | Source path |
 |---|---|
-| `analysis/01_pureclip_postprocessing_noKO.Rmd` | `notebooks/bcells/peakCalling_withoutKOinput_signalComparison/PureCLIP_Postprocessing_noKO.Rmd` |
-| `analysis/02_reproducibility_annotation.Rmd` | `notebooks/bcells/peakCalling_withoutKOinput_signalComparison/akna-pureclip-reproducibility-genomic-analysis_allPeaks_noKO.Rmd` |
+| `analysis/01_pureclip_postprocessing_noKO.ipynb` | `notebooks/bcells/peakCalling_withoutKOinput_signalComparison/PureCLIP_Postprocessing_noKO.Rmd` |
+| `analysis/02_reproducibility_annotation.ipynb` | `notebooks/bcells/peakCalling_withoutKOinput_signalComparison/akna-pureclip-reproducibility-genomic-analysis_allPeaks_noKO.Rmd` |
 | `analysis/03_wt_ko_signal_comparison.R` | `notebooks/bcells/peakCalling_withoutKOinput_signalComparison/signal_comparison.R` |
 | `analysis/04_go_wt_ko_enriched.R` | `notebooks/bcells/paper_figures/rerun_go_wt_ko_enriched.R` |
-| `analysis/05_manuscript_figures.Rmd` | `notebooks/bcells/paper_figures/akna_bcell_noKO_paper_figures.Rmd` |
+| `analysis/05_manuscript_figures.ipynb` | `notebooks/bcells/paper_figures/akna_bcell_noKO_paper_figures.Rmd` |
 
 The workflow is based on `pipeline/Snakefile` and its two retained Python helper
 scripts at the `iclipseq_pipeline` revision above.
@@ -26,7 +26,12 @@ scripts at the `iclipseq_pipeline` revision above.
 ## Deliberate adjustments
 
 - Replaced machine-specific paths with repository-relative configuration,
-  R Markdown parameters, or documented R-script arguments.
+  notebook configuration cells, or documented R-script arguments.
+- Converted analyses 01, 02, and 05 from R Markdown to Jupyter notebooks
+  using IRkernel. The conversion preserves the publication R Markdown analysis
+  chunks; only parameter initialization and notebook-specific path setup change.
+  Source paths above refer to the original R Markdown analyses, which remain
+  available in the source repository.
 - Replaced Snakemake's deprecated `singularity:` rule directive with the
   runtime-agnostic `container:` directive without changing the images.
 - Trimmed the workflow default to the coherent preprocessing, diagnostics, and
