@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Combine independently generated per-sample diagnostic CSV files."""
+"""Combine independently generated per-sample diagnostic CSV files.
+
+Usage: finalize_diagnostics.py OUTPUT.csv SAMPLE.csv [SAMPLE.csv ...]
+
+Inputs must have the same header, including a sample column. Their rows are
+collected and sorted by sample name before writing the final report. This helper
+does not recalculate metrics or remove the input CSV files; the workflow produces
+each sample's counts before this aggregation step.
+"""
+
+from __future__ import annotations
 
 import csv
 from pathlib import Path
@@ -7,6 +17,7 @@ import sys
 
 
 def combine(output: Path, inputs: list[Path]) -> None:
+    # Check the schema before writing, so incompatible reports cannot be combined.
     rows = []
     fieldnames = None
     for path in inputs:
@@ -21,6 +32,7 @@ def combine(output: Path, inputs: list[Path]) -> None:
     if not fieldnames:
         raise ValueError("No diagnostic records were provided")
 
+    # Write one header and a deterministic sample order for the combined report.
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

@@ -1,6 +1,6 @@
 # Software environment
 
-## Verified versions
+## Versions
 
 | Component | Version | Deployment in the workflow |
 |---|---:|---|
@@ -32,21 +32,38 @@ Kent utilities image for `bedGraphToBigWig`:
 docker://abralab/kentutils@sha256:2cad15e98b9c4dd7da4ee4c9504ba9ec26a5cd0322fcd4454e4321d3259512d1
 ```
 
-These supporting containers do not alter the named manuscript tool versions.
-
 ## R packages
 
-The downstream analyses load packages explicitly in each file. In addition to
-`topGO` and `biomaRt`, they require packages including `IRkernel`,
-`rtracklayer`, `GenomicRanges`, `GenomicFeatures`, `AnnotationDbi`, `GO.db`,
-`Rgraphviz`, `dplyr`, `tidyr`, `readr`, `readxl`, `openxlsx`, `writexl`,
-`ggplot2`, `UpSetR`, `reshape2`, `forcats`, `stringr`, `scales`, and `svglite`.
+Use **R 4.4.0 and Bioconductor 3.19**. In R, install the required packages:
 
-Use R 4.4.0 with a matching Bioconductor release and verify package versions
-with `sessionInfo()`. Analysis `05` prints session information in its final
-notebook. BioMart-backed analyses require network access and may vary if the
-live Ensembl annotation service changes; the GENCODE M25 protein-coding
-background and manuscript count checks constrain the analysis input.
+```r
+install.packages("BiocManager", repos = "https://cloud.r-project.org")
+BiocManager::install(version = "3.19", ask = FALSE, update = FALSE)
+BiocManager::install(
+  c("rtracklayer", "GenomicRanges", "GenomicFeatures", "GenomeInfoDb",
+    "AnnotationDbi", "GO.db", "topGO", "biomaRt", "txdbmaker"),
+  version = "3.19", ask = FALSE, update = FALSE
+)
+install.packages(
+  c("IRkernel", "dplyr", "tidyr", "readr", "readxl", "openxlsx", "writexl",
+    "ggplot2", "UpSetR", "reshape2", "forcats", "stringr", "scales",
+    "svglite", "tibble"),
+  repos = "https://cloud.r-project.org"
+)
+```
+
+Check the key versions inside the R kernel:
+
+```r
+stopifnot(
+  getRversion() == "4.4.0",
+  as.character(BiocManager::version()) == "3.19",
+  packageVersion("topGO") == "2.56.0",
+  packageVersion("biomaRt") == "2.60.1"
+)
+sessionInfo()
+```
+
 
 ## Jupyter and the R kernel
 
@@ -56,23 +73,13 @@ Install JupyterLab in your chosen Python environment:
 python -m pip install jupyterlab
 ```
 
-With that environment active and `jupyter` on `PATH`, use the R installation
-containing the analysis packages to install and register IRkernel:
+With that environment active and `jupyter` on `PATH`, use the R installation containing the analysis packages to register IRkernel:
 
 ```r
-install.packages("IRkernel", repos = "https://cloud.r-project.org")
 IRkernel::installspec(user = TRUE, name = "ir", displayname = "R")
 ```
 
-Check registration with `jupyter kernelspec list`, then launch `jupyter lab`
-from the repository root. Open an analysis notebook and select **R**. Check
-`R.version.string` and `sessionInfo()` in the kernel to confirm that it uses
-the intended R installation and packages. IRkernel provides the notebook
-interface; the R packages listed above are still required for the analyses.
-
-The notebooks do not require R Markdown rendering or Pandoc. They are stored
-with empty outputs and execution counts; run cells in order after setting the
-paths in the first code cell.
+Check registration with `jupyter kernelspec list`, then launch `jupyter lab` from the repository root. Open an analysis notebook and select **R**. Check `R.version.string` and `sessionInfo()` in the kernel to confirm that it uses the intended R installation and packages. IRkernel provides the notebook interface; the R packages listed above are still required for the analyses.
 
 ## Apptainer
 
@@ -83,5 +90,4 @@ Snakemake 8.10.7 enables containers with:
 ```
 
 The older `--use-singularity` spelling is retained by Snakemake as an alias.
-When input/output paths are moved outside the repository, configure Apptainer
-bind mounts so every rule can see the configured paths.
+When input/output paths are moved outside the repository, configure Apptainer bind mounts so every rule can see the configured paths.

@@ -1,9 +1,27 @@
 #!/usr/bin/env Rscript
 
+# Gene Ontology enrichment of WT-enriched AKNA target genes
+# -------------------------------------------------------
+# Use the signal-comparison workbook from analysis 03 to select target genes,
+# then test GO enrichment against protein-coding genes from filtered GENCODE M25.
+# The unit of this analysis is a unique gene, not a binding site. Multiple sites
+# in one gene therefore contribute only one foreground entry.
+#
+# Each ontology (BP, CC, MF) is tested with topGO weight01 and Fisher's exact
+# test. BH correction uses the test scores across all tested terms
+# within that ontology. A curated subset of top significant terms is used for the
+# compact manuscript figure; the complete tested-term tables are also exported.
+#
+# Outputs in OUT_DIR: all tested GO terms, compact figure source table, mapping
+# snapshot, an Excel results workbook, and the compact plot as PDF/PNG/SVG.
+# An optional previous plot-term CSV produces a comparison table only; it does
+# not affect gene selection, GO testing, or the corrected plot.
+#
 # Usage:
 # Rscript analysis/04_go_wt_ko_enriched.R SIGNAL.xlsx GENCODE.gtf OUT_DIR \
 #   [PREVIOUS_PLOT_TERMS.csv]
 
+## Load libraries and input/output arguments
 suppressPackageStartupMessages({
   library(AnnotationDbi)
   library(biomaRt)
@@ -37,6 +55,8 @@ old_plot_terms_file <- if (length(args) == 4) args[4] else NA_character_
 stopifnot(file.exists(primary_xlsx), file.exists(annotation_file))
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
+## Select the WT-enriched foreground from the reproducible-site workbook
+# The count checks below verify that the expected manuscript dataset was supplied.
 bs <- read_excel(primary_xlsx, sheet = "all_reproducible_binding_sites") %>%
   mutate(pass_threshold = as.logical(pass_threshold))
 
@@ -47,18 +67,23 @@ if (sum(bs$pass_threshold %in% TRUE) != 2412) {
   )
 }
 
+# Collapse multiple binding sites to unique, nonempty gene symbols.
 foreground_genes_unfiltered <- sort(unique(bs$gene_name[bs$pass_threshold %in% TRUE]))
 foreground_genes_unfiltered <- foreground_genes_unfiltered[
   !is.na(foreground_genes_unfiltered) & foreground_genes_unfiltered != ""
 ]
 
+## Construct the protein-coding background using the analysis-02 annotation filters
 message("Loading and filtering GENCODE vM25 annotation")
 anno <- rtracklayer::import(annotation_file, format = "GTF")
 anno <- anno[anno$level != 3]
+# Internal 0 retains records with a missing TSL attribute; it is not a GENCODE
+# support category. Literal "NA" is mapped to 10 and excluded; levels 1-3 remain.
 anno$transcript_support_level[is.na(anno$transcript_support_level)] <- 0
 anno$transcript_support_level[anno$transcript_support_level == "NA"] <- 10
 anno <- anno[anno$transcript_support_level %in% c(0, 1, 2, 3)]
 
+# Build the transcript database, then recover gene symbols/types from the GTF.
 anno_db <- GenomicFeatures::makeTxDbFromGRanges(anno)
 gns <- GenomicFeatures::genes(anno_db)
 idx <- match(gns$gene_id, anno$gene_id)
@@ -77,6 +102,8 @@ if (length(foreground_genes) != 1243) {
   )
 }
 
+## Retrieve gene-to-GO annotation through Ensembl BioMart
+# Try mirrors if the primary host is unavailable and record the successful host.
 message("Connecting to Ensembl BioMart")
 mart_hosts <- c(
   "https://www.ensembl.org",
@@ -113,9 +140,12 @@ go_mapping <- biomaRt::getBM(
   distinct(external_gene_name, go_id, namespace_1003) %>%
   arrange(external_gene_name, go_id)
 
+# topGO expects a named list of GO identifiers for each gene. Genes without
+# mapped GO terms cannot contribute to the ontology-specific enrichment tests.
 gene_2_GO <- unstack(go_mapping[, c("go_id", "external_gene_name")])
 foreground_genes_with_go <- sort(intersect(foreground_genes, names(gene_2_GO)))
 
+## Run one ontology: foreground membership, GO graph, testing, then BH correction
 run_topgo <- function(ontology) {
   gene_list <- factor(as.integer(background_genes %in% foreground_genes_with_go))
   names(gene_list) <- background_genes
@@ -135,6 +165,8 @@ run_topgo <- function(ontology) {
     orderBy = "weightFisher",
     topNodes = length(usedGO(go_data))
   )
+  # GenTable formats P values for display. Retrieve numeric scores from the test
+  # object instead, so rounding or strings such as "< 1e-30" do not affect BH.
   exact_p <- score(weight_fisher)
 
   result %>%
@@ -150,6 +182,7 @@ run_topgo <- function(ontology) {
       Annotated_background_genes = as.numeric(Annotated),
       Observed_AKNA_target_genes = as.numeric(Significant),
       Expected_AKNA_target_genes = as.numeric(Expected),
+      # Fold enrichment is observed / expected target-gene count, not signal ratio.
       Fold_enrichment = Observed_AKNA_target_genes / Expected_AKNA_target_genes,
       weightFisher_P = unname(exact_p[GO.ID])
     ) %>%
@@ -162,8 +195,10 @@ run_topgo <- function(ontology) {
     arrange(BH_adjusted_P, weightFisher_P)
 }
 
+# Each call adjusts its own ontology before the three result tables are combined.
 message("Running topGO for BP, CC, and MF")
 go_all <- bind_rows(lapply(c("BP", "CC", "MF"), run_topgo))
+# Recover full GO term names rather than the abbreviated labels in GenTable.
 go_term_lookup <- AnnotationDbi::mapIds(
   GO.db::GO.db,
   keys = unique(go_all$GO.ID),
@@ -175,6 +210,9 @@ go_all <- go_all %>%
   mutate(Term = coalesce(unname(go_term_lookup[GO.ID]), Term))
 go_significant <- go_all %>% filter(BH_adjusted_P <= 0.05)
 
+## Select representative functional themes for the manuscript plot
+# This display list is applied after testing; it does not restrict the tests or
+# the multiple-testing correction. The complete tables retain other GO terms.
 go_theme_terms <- tribble(
   ~functional_theme, ~GO.ID,
   "Translation / ribosome", "GO:0022627",
@@ -216,11 +254,13 @@ go_theme_terms <- tribble(
   "Protein homeostasis / complexes", "GO:0140534"
 )
 
+# Generic binding terms are omitted from the compact display only.
 generic_go_ids <- c(
   "GO:0003729", "GO:0019843", "GO:0003723",
   "GO:0003730", "GO:0005515", "GO:0042802"
 )
 
+# Within each curated theme, choose up to three significant terms by raw P value.
 go_functional <- go_significant %>%
   filter(!GO.ID %in% generic_go_ids) %>%
   inner_join(go_theme_terms, by = "GO.ID") %>%
@@ -229,6 +269,8 @@ go_functional <- go_significant %>%
   slice_min(weightFisher_P, n = 3, with_ties = FALSE) %>%
   ungroup()
 
+# Of those representative terms, display only enrichment >=3; wrap labels for
+# the figure and preserve single-line labels in the exported source table.
 go_compact <- go_functional %>%
   filter(Fold_enrichment >= 3) %>%
   arrange(Fold_enrichment) %>%
@@ -252,10 +294,12 @@ go_compact_export <- go_compact %>%
     minus_log10_adjusted_P
   )
 
+# Also export every significant >=3-fold term, independent of the display list.
 go_ge3 <- go_significant %>%
   filter(Fold_enrichment >= 3) %>%
   arrange(desc(Fold_enrichment), BH_adjusted_P)
 
+## Record selection, background, test settings and software in the results workbook
 analysis_summary <- tibble(
   parameter = c(
     "Site selection", "WT/KO threshold",
@@ -282,6 +326,8 @@ analysis_summary <- tibble(
   )
 )
 
+## Optional comparison with a previous plot's term table
+# Without that input, the comparison table simply identifies the new plot terms.
 old_plot_terms <- if (
   !is.na(old_plot_terms_file) && file.exists(old_plot_terms_file)
 ) {
@@ -328,6 +374,7 @@ plot_comparison <- full_join(old_plot_terms, new_plot_terms, by = "GO.ID") %>%
 target_genes <- tibble(gene_name = foreground_genes) %>%
   mutate(has_GO_annotation = gene_name %in% foreground_genes_with_go)
 
+## Export numerical results and the gene-to-GO mapping used for this run
 write_csv(go_all, file.path(out_dir, "go_enrichment_all_WT_KO_enriched_corrected.csv"))
 write_csv(
   go_compact_export,
@@ -355,6 +402,9 @@ write_xlsx(
   file.path(out_dir, "AKNA_noKO_GO_enrichment_WT_KO_enriched_corrected.xlsx")
 )
 
+## Plot the compact enrichment summary
+# X: observed/expected target genes; point area: observed target-gene count;
+# colour: -log10(BH-adjusted P).
 p_go_compact <- go_compact %>%
   ggplot(aes(x = Fold_enrichment, y = Term_for_plot)) +
   geom_point(
