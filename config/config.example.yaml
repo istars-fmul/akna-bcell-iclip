@@ -1,0 +1,52 @@
+# Paths are interpreted from the repository root. 
+# Use with: snakemake --snakefile workflow/Snakefile \
+#   --configfile config/config.example.yaml --software-deployment-method apptainer --cores 8
+paths:
+  # Raw multiplexed FASTQ: {sequencing_run} is replaced by each run name below.
+  input: data/raw/{sequencing_run}.fastq.gz
+  # Workflow outputs are organized by sequencing run and processing stage.
+  output_dir: results/preprocessing
+  # FASTA headers must match sample names. N positions identify the two UMIs
+  # flanking the experimental barcode; their lengths are specified below.
+  barcodes_fasta: data/raw/barcodes.fasta
+  # FASTA containing the 3' adapter used during library preparation.
+  adapters_fasta: data/raw/adapter.fasta
+  # Mouse primary-assembly reference; the workflow can generate its .fai index.
+  reference_genome_fasta: data/reference/GRCm38.primary_assembly.genome.fa
+  # STAR index built from this reference and the annotation below.
+  genome_mapping_index: data/reference/STAR_GRCm38_GencodeM25
+  annotation_gtf: data/reference/gencode.vM25.annotation.gtf
+
+# Names identifying multiplexed sequencing runs.
+sequencing_runs:
+  - akna
+
+# Sample identifiers must agree with the barcode FASTA and downstream track names.
+samples:
+  - WT1
+  - WT2
+  - WT3
+  - KO1
+  - KO2
+
+# Libraries to pool within each run. Keep the group names "replicates" (WT)
+# and "controls" (KO); KO libraries are not used as PureCLIP input controls.
+sample_groups:
+  akna:
+    replicates: [WT1, WT2, WT3]
+    controls: [KO1, KO2]
+
+params:
+  # Minimum sequence length retained by Flexbar after trimming.
+  min_read_length: 15
+  # Maximum length after removal of the barcode/UMIs: 110 - (4 + 6 + 5).
+  # STAR uses this value minus one for sjdbOverhang; it is not a trimming cutoff.
+  max_read_length: 95
+  # Minimum Phred score at every position of the barcode/UMI region.
+  min_base_quality: 10
+  # Bipartite UMI: first segment, experimental barcode, second segment (bases).
+  first_umi_length: 4
+  experimental_barcode_length: 6
+  second_umi_length: 5
+  # Memory limit passed to STAR in bytes for index generation and mapping.
+  ram_limit_genome_mapping: 24000000000.0

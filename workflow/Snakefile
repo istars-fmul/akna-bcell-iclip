@@ -1,0 +1,609 @@
+"""AKNA iCLIP2 preprocessing and no-input-control PureCLIP workflow."""
+
+# Workflow overview
+# Raw reads -> barcode-region QC -> demultiplexing/adapter trimming -> mapping
+# -> UMI deduplication -> strand-specific crosslink tracks -> PureCLIP positions.
+# The experiment contains three WT and two Akna KO biological replicates.
+# KO libraries are processed for signal comparison, not used as PureCLIP input
+# controls. Postprocessing and downstream comparisons are in analysis/01-05.
+#
+# Run from the repository root with Snakemake 8.10.7 and Apptainer:
+# snakemake --snakefile workflow/Snakefile --configfile config/config.example.yaml \
+#   --software-deployment-method apptainer --cores 8
+# Add runtime bind mounts if inputs/outputs are outside the mounted directories.
+
+# Names below distinguish individual libraries from pooled BAMs. "replicates"
+# denotes pooled WT; "controls" denotes pooled KO. Their normalized tracks are
+# pooled-library tracks, not arithmetic means of separately normalized libraries.
+OUT = config["paths"]["output_dir"]
+RUNS = config["sequencing_runs"]
+SAMPLES = config["samples"]
+GROUPS = ["replicates", "controls"]
+TRACK_SETS = SAMPLES + GROUPS
+PURECLIP_SETS = ["WT1", "WT2", "WT3", "replicates"]
+SCRIPTS = "workflow/scripts"
+
+
+# Final targets for preprocessing: quality reports, alignments, crosslink tracks,
+# library diagnostics, and WT-only PureCLIP calls (WT1-3 and pooled WT).
+rule all:
+    input:
+        expand(OUT + "/{run}/fastqc_reports/{run}_fastqc.zip", run=RUNS),
+        expand(OUT + "/{run}/barcode_analysis/{run}_barcodes.detected", run=RUNS),
+        expand(OUT + "/{run}/demultiplexing_trimming/{sample}.readlength.png", run=RUNS, sample=SAMPLES),
+        expand(OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam", run=RUNS, sample=SAMPLES),
+        expand(OUT + "/{run}/duplicate_removal/{sample}.duprm.bam", run=RUNS, sample=SAMPLES),
+        expand(OUT + "/{run}/duplicate_removal/{group}_merged.bam", run=RUNS, group=GROUPS),
+        expand(OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.{strand}.bw", run=RUNS, sample_or_group=TRACK_SETS, strand=["plus", "minus"]),
+        expand(OUT + "/{run}/library_diagnostics/library_diagnostics.csv", run=RUNS),
+        expand(OUT + "/{run}/library_diagnostics/{sample}_iclipro", run=RUNS, sample=SAMPLES),
+        expand(OUT + "/{run}/peak_calling/{sample_or_group}_noinputcontroldata_PureCLIP.crosslink_sites.bed", run=RUNS, sample_or_group=PURECLIP_SETS),
+
+
+# Build the per-run output tree before rules write their reports and data files.
+def folders():
+    stages = [
+        "fastqc_reports", "quality_filter", "barcode_analysis",
+        "demultiplexing_trimming", "genome_mapping", "duplicate_removal",
+        "crosslinked_nucleotides", "library_diagnostics", "peak_calling",
+    ]
+    return [OUT] + [f"{OUT}/{run}/{stage}" for run in RUNS for stage in stages]
+
+
+# Output: one setup marker per run, used as a dependency by downstream rules.
+rule create_folders:
+    output:
+        expand(OUT + "/{run}_setup_complete.marker", run=RUNS)
+    params:
+        folders=" ".join(folders())
+    shell:
+        "mkdir -p {params.folders} && touch {output}"
+
+
+# -----------------------------------------------------------------------------
+# General sequencing quality check
+# -----------------------------------------------------------------------------
+# Input: raw FASTQ for one sequencing run.
+# Output: FastQC HTML and ZIP reports. --nogroup reports individual base positions;
+# --extract unpacks the report archive for inspection.
+rule general_quality_check:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        fastq=lambda wc: config["paths"]["input"].format(sequencing_run=wc.run)
+    output:
+        html=OUT + "/{run}/fastqc_reports/{run}_fastqc.html",
+        zip=OUT + "/{run}/fastqc_reports/{run}_fastqc.zip"
+    params:
+        output_dir=OUT + "/{run}/fastqc_reports"
+    container:
+        "docker://biocontainers/fastqc:v0.11.5_cv4"
+    shell:
+        "fastqc --extract --nogroup --outdir {params.output_dir} {input.fastq}"
+
+
+# -----------------------------------------------------------------------------
+# Quality filtering of the barcode/UMI region
+# -----------------------------------------------------------------------------
+# Inspect the first UMI + experimental barcode + second UMI (15 bases here).
+# FASTX-Toolkit keeps an identifier only if every position (-p 100) has at least
+# min_base_quality. Trimming here creates a temporary view for quality testing;
+# the next rule retrieves the original full-length reads by their retained IDs.
+# Input: raw FASTQ. Output: one passing read identifier per line.
+rule barcode_quality_filter:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        fastq=lambda wc: config["paths"]["input"].format(sequencing_run=wc.run)
+    output:
+        OUT + "/{run}/quality_filter/{run}.qualFilteredIDs.list"
+    params:
+        barcode_length=(config["params"]["first_umi_length"] +
+                        config["params"]["experimental_barcode_length"] +
+                        config["params"]["second_umi_length"]),
+        min_quality=config["params"]["min_base_quality"]
+    container:
+        "docker://biocontainers/fastx-toolkit:v0.0.14-6-deb_cv1"
+    shell:
+        """
+        zcat {input.fastq} | fastx_trimmer -l {params.barcode_length} | \
+          fastq_quality_filter -q {params.min_quality} -p 100 | \
+          awk 'NR % 4 == 1 {{ print substr($1, 2) }}' > {output}
+        """
+
+
+# Extract full-length reads passing the barcode-region quality filter with Seqtk.
+# Replace spaces and slashes in identifiers with '#' to avoid identifier
+# truncation during mapping; compress the resulting quality-filtered FASTQ.
+# Inputs: raw FASTQ and passing IDs. Output: filtered FASTQ for demultiplexing.
+rule extract_filtered_reads:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        ids=OUT + "/{run}/quality_filter/{run}.qualFilteredIDs.list",
+        fastq=lambda wc: config["paths"]["input"].format(sequencing_run=wc.run)
+    output:
+        OUT + "/{run}/quality_filter/{run}.filtered.fastq.gz"
+    container:
+        "docker://biocontainers/seqtk:v1.3-1-deb_cv1"
+    shell:
+        "seqtk subseq {input.fastq} {input.ids} | sed 's/ /#/g; s/\\//#/g' | gzip > {output}"
+
+
+# Count experimental barcode sequences to inspect sample distribution and
+# unexpected barcodes. Skip the first UMI and extract experimental_barcode_length
+# bases from each sequence, then sort unique barcode counts in decreasing order.
+# Input: filtered FASTQ. Output: barcode frequencies (count and sequence).
+rule barcode_frequencies:
+    input:
+        OUT + "/{run}/quality_filter/{run}.filtered.fastq.gz"
+    output:
+        OUT + "/{run}/barcode_analysis/{run}_barcodes.detected"
+    params:
+        umi1=config["params"]["first_umi_length"],
+        barcode=config["params"]["experimental_barcode_length"]
+    shell:
+        """
+        gunzip -c {input} | \
+          awk -v umi1={params.umi1} -v barcode={params.barcode} \
+            '{{if (NR % 4 == 2) print substr($1, umi1 + 1, barcode)}}' | \
+          sort | uniq -c | sort -k1,1nr > {output}
+        """
+
+
+# -----------------------------------------------------------------------------
+# Demultiplexing, adapter and barcode trimming
+# -----------------------------------------------------------------------------
+# Flexbar splits the filtered run into samples using the barcode FASTA labels.
+# --umi-tags captures the N positions of each barcode pattern and appends their
+# sequences to read IDs, preserving UMIs for genomic mapping and deduplication.
+# Barcode matching permits no errors; adapters are read from the adapter FASTA
+# and trimmed from the right. Reads below min_read_length are discarded.
+# Inputs: filtered FASTQ, sample barcode definitions and 3' adapter FASTA.
+# Outputs: per-sample FASTQs and length distributions, unassigned reads, and a
+# Flexbar log with assignment and trimming statistics.
+rule demultiplexing_and_trimming:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        fastq=OUT + "/{run}/quality_filter/{run}.filtered.fastq.gz",
+        barcodes=config["paths"]["barcodes_fasta"],
+        adapters=config["paths"]["adapters_fasta"]
+    output:
+        log=OUT + "/{run}/demultiplexing_trimming/flexbarOut.log",
+        unassigned=OUT + "/{run}/demultiplexing_trimming/flexbarOut_barcode_unassigned.fastq.gz",
+        unassigned_lengths=OUT + "/{run}/demultiplexing_trimming/flexbarOut_barcode_unassigned.fastq.gz.lengthdist",
+        **{f"fastq_{sample}": OUT + f"/{{run}}/demultiplexing_trimming/flexbarOut_barcode_{sample}.fastq.gz" for sample in SAMPLES},
+        **{f"lengths_{sample}": OUT + f"/{{run}}/demultiplexing_trimming/flexbarOut_barcode_{sample}.fastq.gz.lengthdist" for sample in SAMPLES}
+    params:
+        target=OUT + "/{run}/demultiplexing_trimming/flexbarOut",
+        min_length=config["params"]["min_read_length"]
+    container:
+        "docker://biocontainers/flexbar:v1-3.4.0-2-deb_cv1"
+    shell:
+        """
+        flexbar -r {input.fastq} -t {params.target} --zip-output GZ \
+          --barcodes {input.barcodes} --barcode-unassigned \
+          --barcode-trim-end LTAIL --barcode-error-rate 0 \
+          --adapters {input.adapters} --adapter-trim-end RIGHT \
+          --adapter-error-rate 0.1 --adapter-min-overlap 1 \
+          --min-read-length {params.min_length} --umi-tags --length-dist
+        """
+
+
+# Prepare the trimmed-read sequences in FASTA format for length diagnostics.
+# Input: demultiplexed FASTQ. Output: compressed FASTA per sample.
+rule fastq_to_fasta:
+    input:
+        OUT + "/{run}/demultiplexing_trimming/flexbarOut_barcode_{sample}.fastq.gz"
+    output:
+        OUT + "/{run}/demultiplexing_trimming/{sample}.fasta.gz"
+    container:
+        "docker://biocontainers/fastx-toolkit:v0.0.14-6-deb_cv1"
+    shell:
+        "zcat {input} | fastq_to_fasta -n -r | gzip > {output}"
+
+
+# Plot the distribution of read lengths after barcode and adapter removal.
+# Input: sample FASTA. Output: PNG read-length histogram.
+rule plot_reads_length_distribution:
+    input:
+        OUT + "/{run}/demultiplexing_trimming/{sample}.fasta.gz"
+    output:
+        OUT + "/{run}/demultiplexing_trimming/{sample}.readlength.png"
+    container:
+        "docker://biocontainers/fastx-toolkit:v0.0.14-6-deb_cv1"
+    shell:
+        "fasta_clipping_histogram.pl {input} {output}"
+
+
+# -----------------------------------------------------------------------------
+# Reference preparation and genomic mapping
+# -----------------------------------------------------------------------------
+# Index the reference FASTA with SAMtools. The .fai supplies sequence lengths
+# for interval shifting, coverage generation and BigWig conversion.
+rule generate_reference_genome_index:
+    input:
+        config["paths"]["reference_genome_fasta"]
+    output:
+        config["paths"]["reference_genome_fasta"] + ".fai"
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        "samtools faidx {input}"
+
+
+# Build a STAR mapping index from the genome and GENCODE annotation.
+# sjdbOverhang is max_read_length - 1; the RAM limit is specified in bytes.
+# The output directory is reused by all sample-mapping jobs.
+rule generate_STAR_genome_mapping_index:
+    input:
+        fasta=config["paths"]["reference_genome_fasta"],
+        gtf=config["paths"]["annotation_gtf"]
+    output:
+        directory(config["paths"]["genome_mapping_index"])
+    params:
+        genome_dir=config["paths"]["genome_mapping_index"],
+        overhang=config["params"]["max_read_length"] - 1,
+        ram=int(config["params"]["ram_limit_genome_mapping"])
+    threads: 8
+    container:
+        "docker://istarsfmul/star:2.5.4b"
+    shell:
+        """
+        mkdir -p {params.genome_dir}
+        STAR --runThreadN {threads} --limitGenomeGenerateRAM {params.ram} \
+          --runMode genomeGenerate --genomeDir {params.genome_dir} \
+          --genomeFastaFiles {input.fasta} --sjdbGTFfile {input.gtf} \
+          --sjdbOverhang {params.overhang}
+        """
+
+
+# Align each trimmed sample to the reference and retain only unique alignments
+# (--outFilterMultimapNmax 1). Mismatches are limited to 4% of read length.
+# Extend5pOfRead1 controls alignment at the 5' end used for crosslink inference.
+# Outputs include coordinate-sorted BAM, STAR logs, splice junctions and unmapped
+# reads. GENCODE and sjdbOverhang settings match those supplied for index creation.
+rule genome_mapping:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        index=config["paths"]["genome_mapping_index"],
+        fastq=OUT + "/{run}/demultiplexing_trimming/flexbarOut_barcode_{sample}.fastq.gz",
+        gtf=config["paths"]["annotation_gtf"]
+    output:
+        bam=OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam",
+        log=OUT + "/{run}/genome_mapping/{sample}.Log.out",
+        progress=OUT + "/{run}/genome_mapping/{sample}.Log.progress.out",
+        final=OUT + "/{run}/genome_mapping/{sample}.Log.final.out",
+        sj=OUT + "/{run}/genome_mapping/{sample}.SJ.out.tab",
+        unmapped=OUT + "/{run}/genome_mapping/{sample}.Unmapped.out.mate1",
+        star_tmp=directory(OUT + "/{run}/genome_mapping/{sample}._STARgenome")
+    params:
+        prefix=OUT + "/{run}/genome_mapping/{sample}.",
+        genome_dir=config["paths"]["genome_mapping_index"],
+        overhang=config["params"]["max_read_length"] - 1,
+        ram=int(config["params"]["ram_limit_genome_mapping"])
+    threads: 8
+    container:
+        "docker://istarsfmul/star:2.5.4b"
+    shell:
+        """
+        STAR --runThreadN {threads} --limitGenomeGenerateRAM {params.ram} \
+          --runMode alignReads --genomeDir {params.genome_dir} \
+          --outFilterMismatchNoverReadLmax 0.04 --outFilterMismatchNmax 999 \
+          --outFilterMultimapNmax 1 --alignEndsType Extend5pOfRead1 \
+          --sjdbGTFfile {input.gtf} --sjdbOverhang {params.overhang} \
+          --outReadsUnmapped Fastx --outSJfilterReads Unique \
+          --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate \
+          --readFilesIn {input.fastq} --outFileNamePrefix {params.prefix}
+        """
+
+
+# Index the coordinate-sorted BAM for UMI-tools duplicate removal.
+rule prepare_BAM_index:
+    input:
+        OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam"
+    output:
+        OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam.bai"
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        "samtools index {input}"
+
+
+# -----------------------------------------------------------------------------
+# UMI-aware duplicate removal
+# -----------------------------------------------------------------------------
+# Read UMIs from identifiers added by Flexbar. The "unique" method groups reads
+# by alignment position and exact UMI identity; no UMI sequence clustering is
+# requested. Input: indexed mapped BAM. Outputs: deduplicated BAM and run log.
+rule duplicate_removal:
+    input:
+        bam=OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam",
+        bai=OUT + "/{run}/genome_mapping/{sample}.Aligned.sortedByCoord.out.bam.bai"
+    output:
+        bam=OUT + "/{run}/duplicate_removal/{sample}.duprm.bam",
+        log=OUT + "/{run}/duplicate_removal/{sample}.duprm.log"
+    container:
+        "docker://flomicsbiotech/umitools_last_version@sha256:d8e4554ece88a0cededd1cbe024cdf767df15c47a7c6a90ed778ab2ada03bd58"
+    shell:
+        "umi_tools dedup -I {input.bam} -L {output.log} -S {output.bam} --extract-umi-method=read_id --method=unique"
+
+
+# Index individual deduplicated BAMs for iCLIPro and PureCLIP.
+rule prepare_deduplicated_BAM_index:
+    input:
+        OUT + "/{run}/duplicate_removal/{sample}.duprm.bam"
+    output:
+        OUT + "/{run}/duplicate_removal/{sample}.duprm.bam.bai"
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        "samtools index {input}"
+
+
+# Merge deduplicated libraries within the groups defined in sample_groups and
+# index each pooled BAM. Pooling WT supports combined PureCLIP discovery; KO
+# pooling produces a separate track. Group means for IGV are made in analysis 05
+# from the individual normalized tracks, not from these pooled BAMs.
+rule merge_BAM_files:
+    input:
+        lambda wc: expand(
+            OUT + "/{run}/duplicate_removal/{sample}.duprm.bam",
+            run=wc.run,
+            sample=config["sample_groups"][wc.run][wc.group],
+        )
+    output:
+        bam=OUT + "/{run}/duplicate_removal/{group}_merged.bam",
+        bai=OUT + "/{run}/duplicate_removal/{group}_merged.bam.bai"
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        "samtools merge -f {output.bam} {input} && samtools index {output.bam}"
+
+
+# Resolve either an individual sample BAM or its group's pooled BAM.
+def deduplicated_bam(wc):
+    if wc.sample_or_group in SAMPLES:
+        return f"{OUT}/{wc.run}/duplicate_removal/{wc.sample_or_group}.duprm.bam"
+    return f"{OUT}/{wc.run}/duplicate_removal/{wc.sample_or_group}_merged.bam"
+
+
+# Both individual and pooled BAM indices use the same <bam>.bai suffix.
+def deduplicated_bai(wc):
+    return deduplicated_bam(wc) + ".bai"
+
+
+# -----------------------------------------------------------------------------
+# Extraction of crosslinked nucleotides
+# -----------------------------------------------------------------------------
+# Convert deduplicated alignments to BED intervals, retaining strand information.
+# These still describe alignment spans; the 5' end is selected during genomecov.
+rule bam_to_bed:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        bam=deduplicated_bam
+    output:
+        OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}_original.bed"
+    container:
+        "docker://biocontainers/bedtools:v2.27.1dfsg-4-deb_cv1"
+    shell:
+        "bedtools bamtobed -i {input.bam} > {output}"
+
+
+# Infer the crosslink one nucleotide upstream of the aligned 5' end by shifting
+# plus-strand intervals -1 and minus-strand intervals +1. The reference index
+# supplies chromosome boundaries to BEDTools.
+rule shift_crosslinks:
+    input:
+        bed=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}_original.bed",
+        fai=config["paths"]["reference_genome_fasta"] + ".fai"
+    output:
+        OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.shifted.bed"
+    container:
+        "docker://biocontainers/bedtools:v2.27.1dfsg-4-deb_cv1"
+    shell:
+        "bedtools shift -m 1 -p -1 -i {input.bed} -g {input.fai} > {output}"
+
+
+# Compute 1,000,000 / number of deduplicated BAM records for each sample or pool.
+# The factor is written to six decimal places and reused for both strands.
+# This is library-size normalization; the denominator is not strand-specific.
+rule calculate_scaling_factor:
+    input:
+        deduplicated_bam
+    output:
+        temp(OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.scale.txt")
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        """
+        count=$(samtools view -c {input})
+        awk -v count=$count 'BEGIN {{if (count == 0) exit 1; printf "%.6f\\n", 1000000 / count}}' > {output}
+        """
+
+
+# Pile up only the 5' end (-5) of the shifted intervals, separately by strand.
+# Multiply by the library scaling factor to obtain per-position RPM signal.
+# Both outputs contain nonnegative values; strand is encoded by separate files.
+# Inputs: shifted BED, reference index, scale. Outputs: plus/minus bedGraphs.
+rule normalized_bedgraph:
+    input:
+        bed=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.shifted.bed",
+        fai=config["paths"]["reference_genome_fasta"] + ".fai",
+        scale=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.scale.txt"
+    output:
+        plus=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.plus.bedgraph",
+        minus=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.minus.bedgraph"
+    container:
+        "docker://biocontainers/bedtools:v2.27.1dfsg-4-deb_cv1"
+    shell:
+        """
+        scale=$(cat {input.scale})
+        bedtools genomecov -scale $scale -bg -strand + -5 -i {input.bed} -g {input.fai} > {output.plus}
+        bedtools genomecov -scale $scale -bg -strand - -5 -i {input.bed} -g {input.fai} > {output.minus}
+        """
+
+
+# Generate the same strand-specific crosslink tracks without RPM scaling.
+# Integer event counts are required for library-complexity diagnostics.
+rule unnormalized_bedgraph:
+    input:
+        bed=OUT + "/{run}/crosslinked_nucleotides/{sample}.shifted.bed",
+        fai=config["paths"]["reference_genome_fasta"] + ".fai"
+    output:
+        plus=OUT + "/{run}/crosslinked_nucleotides/{sample}.plus.unnormalized.bedgraph",
+        minus=OUT + "/{run}/crosslinked_nucleotides/{sample}.minus.unnormalized.bedgraph"
+    container:
+        "docker://biocontainers/bedtools:v2.27.1dfsg-4-deb_cv1"
+    shell:
+        """
+        bedtools genomecov -bg -strand + -5 -i {input.bed} -g {input.fai} > {output.plus}
+        bedtools genomecov -bg -strand - -5 -i {input.bed} -g {input.fai} > {output.minus}
+        """
+
+
+# Sort by chromosome and start coordinate with C collation before conversion to
+# BigWig. Each row describes a half-open interval of constant signal.
+rule sort_bedgraph:
+    input:
+        OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.{strand}.bedgraph"
+    output:
+        OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.{strand}.sorted.bedgraph"
+    shell:
+        "LC_COLLATE=C sort -k1,1 -k2,2n {input} > {output}"
+
+
+# Convert sorted bedGraph to indexed BigWig using the reference sequence lengths.
+# The individual normalized BigWigs are inputs to analyses 02, 03 and 05;
+# the pooled-WT BigWigs are used for candidate postprocessing in analysis 01.
+rule bedgraph_to_bigwig:
+    input:
+        bedgraph=OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.{strand}.sorted.bedgraph",
+        fai=config["paths"]["reference_genome_fasta"] + ".fai"
+    output:
+        OUT + "/{run}/crosslinked_nucleotides/{sample_or_group}.{strand}.bw"
+    container:
+        "docker://abralab/kentutils@sha256:2cad15e98b9c4dd7da4ee4c9504ba9ec26a5cd0322fcd4454e4321d3259512d1"
+    shell:
+        "bedGraphToBigWig {input.bedgraph} {input.fai} {output}"
+
+
+# -----------------------------------------------------------------------------
+# Diagnostic plots and measures of library complexity
+# -----------------------------------------------------------------------------
+# Inputs: unnormalized plus/minus crosslink tracks and deduplicated sample BAM.
+# Output: one independent diagnostic CSV per sample, later combined by a helper.
+# - total_reads: records in the deduplicated BAM, not raw sequencing depth.
+# - num_uniquely_mapped_reads: non-secondary BAM records with STAR MAPQ 255.
+# - num_crosslink_events: sum of interval width * crosslink count.
+# - num_crosslinked_nucleotides: sum of covered interval widths; the same genomic
+#   position on opposite strands counts twice.
+# - num_stacked_crosslink_events: all events at positions with count >1.
+# - num_nucleotides_stacked_crosslink_events: positions with count >1.
+# - num_deletions / num_insertions: reads whose CIGAR contains D / I, respectively,
+#   rather than numbers of deleted/inserted bases. A read can contribute to both.
+rule sample_diagnostics:
+    input:
+        plus=OUT + "/{run}/crosslinked_nucleotides/{sample}.plus.unnormalized.bedgraph",
+        minus=OUT + "/{run}/crosslinked_nucleotides/{sample}.minus.unnormalized.bedgraph",
+        bam=OUT + "/{run}/duplicate_removal/{sample}.duprm.bam"
+    output:
+        OUT + "/{run}/library_diagnostics/{sample}.diagnostics.csv"
+    container:
+        "docker://biocontainers/samtools:v1.9-4-deb_cv1"
+    shell:
+        """
+        total_reads=$(samtools view -c {input.bam})
+        unique_reads=$(samtools view -c -F 256 -q 255 {input.bam})
+        crosslinks=$(awk 'BEGIN{{n=0}}{{n += (($3-$2)*$4)}}END{{print n}}' {input.plus} {input.minus})
+        nucleotides=$(awk 'BEGIN{{n=0}}{{n += ($3-$2)}}END{{print n}}' {input.plus} {input.minus})
+        stacked=$(awk 'BEGIN{{n=0}}{{if($4>1)n += (($3-$2)*$4)}}END{{print n}}' {input.plus} {input.minus})
+        stacked_nt=$(awk 'BEGIN{{n=0}}{{if($4>1)n += ($3-$2)}}END{{print n}}' {input.plus} {input.minus})
+        deletions=$(samtools view {input.bam} | cut -f6 | grep -c D || true)
+        insertions=$(samtools view {input.bam} | cut -f6 | grep -c I || true)
+        printf '%s\n' 'sample,total_reads,num_uniquely_mapped_reads,num_crosslink_events,num_crosslinked_nucleotides,num_stacked_crosslink_events,num_nucleotides_stacked_crosslink_events,num_deletions,num_insertions' > {output}
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' '{wildcards.sample}' "$total_reads" "$unique_reads" "$crosslinks" "$nucleotides" "$stacked" "$stacked_nt" "$deletions" "$insertions" >> {output}
+        """
+
+
+# Combine per-sample CSVs after all diagnostic jobs finish. The helper checks
+# column consistency and writes one sample-sorted report for the sequencing run.
+rule finalize_diagnostics:
+    input:
+        lambda wc: expand(OUT + "/{run}/library_diagnostics/{sample}.diagnostics.csv", run=wc.run, sample=SAMPLES)
+    output:
+        OUT + "/{run}/library_diagnostics/library_diagnostics.csv"
+    params:
+        script=SCRIPTS + "/finalize_diagnostics.py"
+    container:
+        "docker://python:3.8-slim"
+    shell:
+        "python {params.script:q} {output:q} {input:q}"
+
+
+# -----------------------------------------------------------------------------
+# Read-end quality assessment with iCLIPro
+# -----------------------------------------------------------------------------
+# Read the Flexbar length distribution and format group (-g) and comparison (-p)
+# arguments. Each observed length defines a group; the longest is reference R.
+# Output: a temporary line containing the two space-separated argument strings.
+rule generate_iCLIPro_params:
+    input:
+        OUT + "/{run}/demultiplexing_trimming/flexbarOut_barcode_{sample}.fastq.gz.lengthdist"
+    output:
+        temp(OUT + "/{run}/library_diagnostics/{sample}_iclipro_params.txt")
+    params:
+        script=SCRIPTS + "/parse_length_distribution.py"
+    container:
+        "docker://python:3.9-slim"
+    shell:
+        "python {params.script:q} {input:q} > {output:q}"
+
+
+# Detect coinciding read starts, centres and ends across fragment-length groups
+# to assess read-end patterns. Inputs: indexed deduplicated BAM and length-group
+# arguments. Output: the sample's iCLIPro diagnostic directory.
+rule iCLIPro_analysis:
+    input:
+        bam=OUT + "/{run}/duplicate_removal/{sample}.duprm.bam",
+        bai=OUT + "/{run}/duplicate_removal/{sample}.duprm.bam.bai",
+        params=OUT + "/{run}/library_diagnostics/{sample}_iclipro_params.txt"
+    output:
+        directory(OUT + "/{run}/library_diagnostics/{sample}_iclipro")
+    container:
+        "docker://istarsfmul/iclipro:0.1.1_patch"
+    shell:
+        """
+        read -r groups comparisons < {input.params}
+        iCLIPro -r 50 -b 300 -f 50 -g "$groups" -p "$comparisons" -o {output} {input.bam}
+        """
+
+
+# -----------------------------------------------------------------------------
+# WT-only PureCLIP crosslink-position discovery
+# -----------------------------------------------------------------------------
+# Run PureCLIP on each WT library and pooled WT without KO input-control data.
+# Inputs: deduplicated BAM, BAM index and reference FASTA.
+# Outputs: significant single-nucleotide positions, crosslink regions, learned
+# parameters, and a six-column BED copy of the positions for downstream import.
+# Analysis 01 converts the pooled significant positions into 9-nt candidate
+# binding sites. The regional BED output is not that final binding-site set.
+rule peakCalling_replicates_only:
+    input:
+        setup=OUT + "/{run}_setup_complete.marker",
+        bam=deduplicated_bam,
+        bai=deduplicated_bai,
+        genome=config["paths"]["reference_genome_fasta"]
+    output:
+        sites=OUT + "/{run}/peak_calling/{sample_or_group}_noinputcontroldata_PureCLIP.crosslink_sites.bed",
+        params=OUT + "/{run}/peak_calling/{sample_or_group}_noinputcontroldata_PureCLIP.crosslink_sites.params",
+        regions=OUT + "/{run}/peak_calling/{sample_or_group}_noinputcontroldata_PureCLIP.crosslink_regions.bed",
+        short=OUT + "/{run}/peak_calling/{sample_or_group}_noinputcontroldata_PureCLIP.crosslink_sites_short.bed"
+    wildcard_constraints:
+        sample_or_group="WT1|WT2|WT3|replicates"
+    threads: 4
+    container:
+        "docker://istarsfmul/pureclip:1.3.1"
+    shell:
+        """
+        pureclip -i {input.bam} -bai {input.bai} -g {input.genome} -ld -nt {threads} \
+          -o {output.sites} -or {output.regions}
+        cut -f1-6 {output.sites} > {output.short}
+        """
